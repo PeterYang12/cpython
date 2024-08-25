@@ -32,8 +32,21 @@
 #include <Python.h>
 #include "pycore_long.h"          // _PyLong_IsZero()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_typeobject.h"
 #include "complexobject.h"
-#include "mpdecimal.h"
+
+#include <mpdecimal.h>
+
+// Reuse config from mpdecimal.h if present.
+#if defined(MPD_CONFIG_64)
+  #ifndef CONFIG_64
+    #define CONFIG_64 MPD_CONFIG_64
+  #endif
+#elif defined(MPD_CONFIG_32)
+  #ifndef CONFIG_32
+    #define CONFIG_32 MPD_CONFIG_32
+  #endif
+#endif
 
 #include <ctype.h>                // isascii()
 #include <stdlib.h>
@@ -120,11 +133,8 @@ get_module_state_by_def(PyTypeObject *tp)
 static inline decimal_state *
 find_state_left_or_right(PyObject *left, PyObject *right)
 {
-    PyObject *mod = PyType_GetModuleByDef(Py_TYPE(left), &_decimal_module);
-    if (mod == NULL) {
-        PyErr_Clear();
-        mod = PyType_GetModuleByDef(Py_TYPE(right), &_decimal_module);
-    }
+    PyObject *mod = _PyType_GetModuleByDef2(Py_TYPE(left), Py_TYPE(right),
+                                            &_decimal_module);
     assert(mod != NULL);
     return get_module_state(mod);
 }
@@ -1380,6 +1390,10 @@ context_new(PyTypeObject *type, PyObject *args UNUSED, PyObject *kwds UNUSED)
     CtxCaps(self) = 1;
     self->tstate = NULL;
 
+    if (type == state->PyDecContext_Type) {
+        PyObject_GC_Track(self);
+    }
+    assert(PyObject_GC_IsTracked((PyObject *)self));
     return (PyObject *)self;
 }
 
@@ -1509,7 +1523,7 @@ init_extended_context(PyObject *v)
 #ifdef EXTRA_FUNCTIONALITY
 /* Factory function for creating IEEE interchange format contexts */
 static PyObject *
-ieee_context(PyObject *dummy UNUSED, PyObject *v)
+ieee_context(PyObject *module, PyObject *v)
 {
     PyObject *context;
     mpd_ssize_t bits;
@@ -1526,7 +1540,7 @@ ieee_context(PyObject *dummy UNUSED, PyObject *v)
         goto error;
     }
 
-    decimal_state *state = get_module_state_by_def(Py_TYPE(v));
+    decimal_state *state = get_module_state(module);
     context = PyObject_CallObject((PyObject *)state->PyDecContext_Type, NULL);
     if (context == NULL) {
         return NULL;
@@ -2028,6 +2042,10 @@ PyDecType_New(PyTypeObject *type)
     MPD(dec)->alloc = _Py_DEC_MINALLOC;
     MPD(dec)->data = dec->data;
 
+    if (type == state->PyDec_Type) {
+        PyObject_GC_Track(dec);
+    }
+    assert(PyObject_GC_IsTracked((PyObject *)dec));
     return (PyObject *)dec;
 }
 #define dec_alloc(st) PyDecType_New((st)->PyDec_Type)
@@ -2415,12 +2433,12 @@ PyDecType_FromFloatExact(PyTypeObject *type, PyObject *v,
     }
     sign = (copysign(1.0, x) == 1.0) ? 0 : 1;
 
-    if (Py_IS_NAN(x) || Py_IS_INFINITY(x)) {
+    if (isnan(x) || isinf(x)) {
         dec = PyDecType_New(type);
         if (dec == NULL) {
             return NULL;
         }
-        if (Py_IS_NAN(x)) {
+        if (isnan(x)) {
             /* decimal.py calls repr(float(+-nan)),
              * which always gives a positive result. */
             mpd_setspecial(MPD(dec), MPD_POS, MPD_NAN);
@@ -4277,7 +4295,7 @@ nm_mpd_qdivmod(PyObject *v, PyObject *w)
         return NULL;
     }
 
-    ret = Py_BuildValue("(OO)", q, r);
+    ret = PyTuple_Pack(2, q, r);
     Py_DECREF(r);
     Py_DECREF(q);
     return ret;
@@ -4780,7 +4798,7 @@ _dec_hash(PyDecObject *v)
             return -1;
         }
         else if (mpd_isnan(MPD(v))) {
-            return _Py_HashPointer(v);
+            return PyObject_GenericHash((PyObject *)v);
         }
         else {
             return py_hash_inf * mpd_arith_sign(MPD(v));
@@ -5302,7 +5320,7 @@ ctx_mpd_qdivmod(PyObject *context, PyObject *args)
         return NULL;
     }
 
-    ret = Py_BuildValue("(OO)", q, r);
+    ret = PyTuple_Pack(2, q, r);
     Py_DECREF(r);
     Py_DECREF(q);
     return ret;
@@ -6133,8 +6151,22 @@ decimal_clear(PyObject *module)
     Py_CLEAR(state->SignalTuple);
     Py_CLEAR(state->PyDecimal);
 
-    PyMem_Free(state->signal_map);
-    PyMem_Free(state->cond_map);
+    if (state->signal_map != NULL) {
+        for (DecCondMap *cm = state->signal_map; cm->name != NULL; cm++) {
+            Py_DECREF(cm->ex);
+        }
+        PyMem_Free(state->signal_map);
+        state->signal_map = NULL;
+    }
+
+    if (state->cond_map != NULL) {
+        // cond_map[0].ex has borrowed a reference from signal_map[0].ex
+        for (DecCondMap *cm = state->cond_map + 1; cm->name != NULL; cm++) {
+            Py_DECREF(cm->ex);
+        }
+        PyMem_Free(state->cond_map);
+        state->cond_map = NULL;
+    }
     return 0;
 }
 
@@ -6147,6 +6179,7 @@ decimal_free(void *module)
 static struct PyModuleDef_Slot _decimal_slots[] = {
     {Py_mod_exec, _decimal_exec},
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
     {0, NULL},
 };
 
